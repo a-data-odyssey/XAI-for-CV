@@ -1,7 +1,14 @@
-from skimage import feature, color
-import torch
 import numpy as np
 
+from skimage import feature, color
+import matplotlib.cm as cm
+
+import torch
+
+import cv2
+from PIL import Image
+
+import warnings
 import urllib
 
 def get_edge(image,h1=0.1,h2=0.3, sigma=2, as_image=False):
@@ -17,6 +24,32 @@ def get_edge(image,h1=0.1,h2=0.3, sigma=2, as_image=False):
 
     return edge
 
+def add_edge_to_attributions(attributions, edge,edge_colour='black'):
+    """ Add edge to attributions"""
+
+    #Check to see if is numpy array
+    assert isinstance(attributions, np.ndarray), "Attributions must be a numpy array"
+    assert isinstance(edge, np.ndarray), "Edge must be a numpy array"
+    attr_with_edge = attributions.copy()
+
+    if edge_colour=='black':
+        edge_value = np.min(attributions)
+    elif edge_colour=='white':
+        edge_value = np.max(attributions)
+
+    print("edge value:",edge_value )
+
+    # Overlay edge on attributions
+    if attributions.ndim == 3 and edge.ndim == 2:
+        #3 channel attributions and single channel edge
+        for c in range(attributions.shape[2]):
+            attr_with_edge[:,:,c][edge==True] = edge_value
+    elif attributions.ndim == 2 and edge.ndim == 2:
+        #Single channel attributions and single channel edge
+        attr_with_edge[edge==True] = edge_value
+
+    return attr_with_edge
+
 def grads_from_tensor(grads_in):
     """Conver tensor to numpy array"""
 
@@ -25,67 +58,88 @@ def grads_from_tensor(grads_in):
 
     return grads
 
-def process_grads(grads_in,
-                  activation="None",
-                  skew=True,
-                  normalize=True,
-                  greyscale=False,
-                  edge=None):
+def process_attributions(
+    raw_attributions: torch.Tensor,
+    activation: str | None = None,  # ['abs', 'relu', 'none']
+    normalize: bool = True,
+    skew: float = 1.0,
+    grayscale: bool = False,
+    colormap: str | None = None,  # <-- Default: None (no colormap)
+    output_as_pil: bool = False
+):
     """
-    Process the gradients for visualization.
+    Visualize gradient or attribution maps for image classification.
 
-    Parameters:
-        grads_in (np.array): Gradients to be processed.
-        activation (str): Activation function to be applied to the gradients. Options: "relu", "abs".
-        skew (bool): Whether to skew the gradients.
-        normalize (bool): Whether to normalize the gradients.
-        greyscale (bool): Whether to convert the gradients to greyscale.
-        edge (np.array): Edge map to overlay on the gradients.
+    Args:
+        attribution (torch.Tensor): Attribution map with shape (C, H, W) or (H, W).
+        activation (str): Activation applied to attributions ('abs', 'relu', or 'none').
+        normalize (bool): Whether to normalize attributions to [0, 1].
+        skew (float): Exponent to skew intensities (gamma correction). Only valid if normalize=True.
+        grayscale (bool): If True, converts output to grayscale before applying colormap.
+        colormap (str or None): Matplotlib colormap ('hot', 'coolwarm', etc.) or None for no color mapping.
+        output_as_pil (bool): If True, returns a PIL Image instead of NumPy array.
 
     Returns:
-        np.array: Processed gradients.
+        np.ndarray or PIL.Image: Visualized attribution map (RGB or grayscale).
     """
 
-    #Convert tensor:
-    if type(grads_in) == torch.Tensor:
-        grads = grads_from_tensor(grads_in)
+    # --- Safety checks ---
+    if not normalize and skew != 1.0:
+        raise ValueError("Cannot apply skew without normalization. Set normalize=True or skew=1.0.")
+    if activation not in ["abs", "relu", None]:
+        raise ValueError("Invalid activation. Choose from ['abs', 'relu', None].")
+    if grayscale and colormap is not None:
+        warnings.warn("Grayscale=True overrides colormap choice. Colormap will be ignored.", UserWarning)
+
+    # Convert to NumPy
+    if isinstance(raw_attributions, torch.Tensor):
+        attribution = raw_attributions.detach().cpu().numpy()
     else:
-        # Copy the gradients
-        grads = np.copy(grads_in)
+        attribution = raw_attributions.copy()
 
-        # Transpose the gradients
-        if (len(grads.shape) >= 3) and (grads.shape[0] == 3):
-            grads = np.transpose(grads, (1, 2, 0))
+    # Handle multi-channel case (1, C, H, W)
+    if attribution.shape[0] == 1:
+        attribution = attribution[0]
+    if attribution.ndim == 3 and attribution.shape[0] == 3:
+        attribution = np.transpose(attribution, (1, 2, 0))  # C, H, W -> H, W, C
 
-    # Get the absolute value of the gradients
-    if activation == "relu":
-        grads = np.maximum(0, grads)
-    elif activation == "abs":
-        grads = np.abs(grads)
-    else:
-        grads = grads
+    # --- Apply activation ---
+    if activation == "abs":
+        attribution = np.abs(attribution)
+    elif activation == "relu":
+        attribution = np.maximum(0, attribution)
+    # 'none' → do nothing
 
-    # Normalize the gradients
+    # --- Normalization ---
     if normalize:
-        grads -= np.min(grads)
-        grads /= (np.max(grads)+1e-9)
+        attribution -= attribution.min()
+        if attribution.max() > 0:
+            attribution /= attribution.max()
 
-    # Skew the gradients
-    if skew:
-        grads = np.sqrt(grads)
+    # --- Skewing (gamma correction) ---
+    if skew != 1.0:
+        attribution = np.power(attribution, skew)
 
-    # Convert the gradients to greyscale
-    if greyscale:
-        grads = np.mean(grads, axis=-1)
+    # --- Visualization logic ---
+    if grayscale or (colormap is not None):
+        # Return single-channel map (grayscale look)
+        if attribution.ndim == 3:
+            attribution = np.mean(attribution, axis=-1)
 
-    if edge is not None:
-        if greyscale == False:
-            edge = np.expand_dims(edge, axis=2)  # make HWC
-        # make 1 where edge is, original value elsewhere
-        grads = np.minimum(grads, 1-edge)
+        attribution_img = np.uint8(255 * np.clip(attribution, 0, 1))
+        result = cv2.cvtColor(attribution_img, cv2.COLOR_GRAY2RGB)
 
+    if colormap is not None:
+        cmap = cm.get_cmap(colormap)
+        colored = cmap(attribution)[:, :, :3]
+        result = np.uint8(255 * colored)
+    else:
+        # No colormap, return as RGB
+        result = attribution
 
-    return grads
+    if output_as_pil:
+        return Image.fromarray(result)
+    return result
 
 def display_imagenet_output(output,n=5):
 
